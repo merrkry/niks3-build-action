@@ -1,0 +1,32 @@
+name: Build
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: NixOS/nix-installer-action@v1
+
+      - uses: Mic92/niks3-action@952f6bcde3f794cc498ad9e96d8d491777870829
+        with:
+          server-url: https://niks3-api.tsubasa.moe
+          skip-push: true
+
+      - uses: merrkry/niks3-build-action@master
+        with:
+          server-url: https://niks3-api.tsubasa.moe
+          accept-flake-config: true
+          upload-cached: true
+          flake: .#checks.x86_64-linux
+          args: |
+            --eval-workers 4
+            --eval-max-memory-size 4096
+            --push-build-closure

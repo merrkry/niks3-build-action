@@ -1,0 +1,40 @@
+{
+  "name": "niks3-build-action",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsdown",
+    "check": "pnpm run format:check && pnpm run lint && pnpm run typecheck && pnpm run build && pnpm run test",
+    "format": "oxfmt .",
+    "format:check": "oxfmt --check .",
+    "lint": "oxlint .",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@actions/core": "^3.0.1",
+    "@actions/http-client": "^4.0.1",
+    "@actions/io": "^3.0.2",
+    "better-result": "^3.0.1",
+    "execa": "^10.0.1",
+    "jwt-decode": "^4.0.0",
+    "p-queue": "^9.3.3",
+    "shell-quote": "^1.10.0",
+    "string-argv": "^0.3.2",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.6",
+    "@types/shell-quote": "^1.7.5",
+    "fastify": "^5.12.5",
+    "oxfmt": "^0.68.0",
+    "oxlint": "^1.83.0",
+    "tsdown": "^0.23.0",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.1"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "packageManager": "pnpm@12.3.4"
+}
