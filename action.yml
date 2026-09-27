@@ -1,20 +1,20 @@
 name: Build and cache with niks3
-description: Run nix-fast-build, upload successful outputs, and refresh remote cache TTLs
+description: Build a flake with nix-fast-build, push the results to niks3, and keep already cached results alive
 inputs:
   server-url:
-    description: Target niks3 API URL
+    description: niks3 server URL, such as https://cache.example.com
     required: true
   flake:
-    description: Flake reference and output to build, such as .#checks.x86_64-linux
+    description: Flake reference and attribute to build, such as .#checks.x86_64-linux
     required: true
   args:
-    description: nix-fast-build arguments on one or more lines; quote values containing spaces. No shell expansion.
+    description: Extra nix-fast-build arguments, split on whitespace and newlines. Quotes work; shell expansion does not.
     default: ""
   accept-flake-config:
-    description: Apply the target flake nixConfig to evaluation, builds, and cache downloads
+    description: Use the nixConfig of the target flake (substituters, keys, etc.) while evaluating, building, and downloading
     default: "true"
   upload-cached:
-    description: Download outputs found only in other substituters and upload them to niks3
+    description: Download outputs that only exist in other substituters and push them to niks3
     default: "true"
 runs:
   using: node24

@@ -1,3 +1,4 @@
+# Full example with every input. See README.md for what each step does.
 name: Build
 on:
   push:
@@ -6,6 +7,8 @@ on:
 
 permissions:
   contents: read
+  # Needed to push to niks3. Without it (e.g. pull requests from forks), the
+  # action still builds but skips uploads and TTL refresh.
   id-token: write
 
 jobs:
@@ -13,19 +16,33 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+
+      # Any Nix installation with flakes enabled works.
       - uses: NixOS/nix-installer-action@v1
 
-      - uses: Mic92/niks3-action@952f6bcde3f794cc498ad9e96d8d491777870829
+      # Add niks3 as a substituter, so outputs already in niks3 are skipped
+      # or downloaded instead of rebuilt. skip-push: true leaves uploading to
+      # niks3-build-action; otherwise both actions would push.
+      - uses: Mic92/niks3-action@v1
         with:
-          server-url: https://niks3-api.tsubasa.moe
+          server-url: https://cache.example.com
           skip-push: true
 
       - uses: merrkry/niks3-build-action@master
         with:
-          server-url: https://niks3-api.tsubasa.moe
-          accept-flake-config: true
-          upload-cached: true
+          # Required. HTTP(S) URL without credentials, query, or fragment.
+          server-url: https://cache.example.com
+          # Required. Flake reference plus the attribute set to build.
           flake: .#checks.x86_64-linux
+          # Default: true. Use the flake's nixConfig (substituters, keys, ...).
+          accept-flake-config: true
+          # Default: true. Outputs found only in other caches (e.g.
+          # cache.nixos.org or a flake substituter) are downloaded and pushed
+          # to niks3. Set to false to leave them where they are.
+          upload-cached: true
+          # Default: empty. Extra nix-fast-build arguments. The action sets
+          # --flake, --skip-cached, --stream-json-lines, --no-nom,
+          # --niks3-server and accept-flake-config itself; passing them fails.
           args: |
             --eval-workers 4
             --eval-max-memory-size 4096
