@@ -12,7 +12,7 @@ export async function installClient() {
   if (!(await which("niks3"))) {
     await writeFile(
       join(work, "niks3"),
-      `#!/bin/sh\nexec ${quote(["nix", "run", `github:NixOS/nixpkgs/${versions.nixpkgs}#niks3`, "--"])} "$@"\n`,
+      `#!/bin/sh\nexec ${quote(["nix", "run", `github:Mic92/niks3/v${versions.niks3}#niks3`, "--"])} "$@"\n`,
       { mode: 0o755 },
     );
     process.env.PATH = `${work}${delimiter}${process.env.PATH ?? ""}`;

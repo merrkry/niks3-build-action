@@ -121,6 +121,19 @@ const args = process.argv.slice(2);
 const token = readFileSync(process.env.NIKS3_AUTH_TOKEN_FILE, 'utf8');
 const paths = args.includes('--stdin') ? readFileSync(0, 'utf8').trim().split('\\n') : args.filter(arg => arg.startsWith('/nix/store/'));
 appendFileSync(process.env.PUSH_LOG, JSON.stringify({ args, token, paths, config: process.env.NIX_CONFIG }) + '\\n');
+if (args.includes('--stdin')) {
+  for (const path of paths) {
+    if (path === process.env.MISSING_UPLOAD) continue;
+    if (process.env.INVALID_UPLOAD) { console.log('invalid JSON'); break; }
+    console.log(JSON.stringify({
+      path,
+      status: path === process.env.FAIL_UPLOAD ? 'error' : 'ok',
+      ...(path === process.env.FAIL_UPLOAD ? { message: 'server returned 503: unavailable' } : {}),
+      ...(path === process.env.SKIP_UPLOAD ? { skipped: 'max-nar-size', message: 'dependency exceeds server limit' } : {}),
+    }));
+  }
+  if (process.env.UPLOAD_EXIT) process.exitCode = Number(process.env.UPLOAD_EXIT);
+}
 `,
     { mode: 0o755 },
   );
@@ -138,7 +151,7 @@ if (args[0] === 'flake' || args[0] === 'eval') {
   process.exit(0);
 }
 const tools = {
-  ${JSON.stringify(`github:NixOS/nixpkgs/${versions.nixpkgs}#niks3`)}: ${JSON.stringify(realBinary)},
+  ${JSON.stringify(`github:Mic92/niks3/v${versions.niks3}#niks3`)}: ${JSON.stringify(realBinary)},
   ${JSON.stringify(`github:NixOS/nixpkgs/${versions.nixpkgs}#nix-fast-build`)}: ${JSON.stringify(join(directory, "nix-fast-build"))},
 };
 assert.equal(args[0], 'run');
@@ -455,7 +468,7 @@ test("remote copies share one CLI push and cannot block TTL refresh", async (t) 
   assert.deepEqual(push.paths, [storePath("b"), storePath("c")]);
   assert.match(result.stdout, /1 awaiting TTL refresh, 2 awaiting cross-cache upload/);
   assert.match(result.stdout, /TTL refresh batch 1: completed \(1 outputs\)/);
-  assert.match(result.stdout, /Cross-cache upload batch 1: completed \(2 outputs\)/);
+  assert.match(result.stdout, /Cross-cache upload: 2 uploaded, 0 skipped, 0 failed/);
   const normalLogs = result.stdout
     .split("\n")
     .filter((line) => !line.startsWith("::debug::"))
@@ -464,6 +477,62 @@ test("remote copies share one CLI push and cannot block TTL refresh", async (t) 
   assert.equal(context.tokens.length, 1);
   assert.deepEqual(context.completed, [`${"a".repeat(32)}.narinfo`]);
 });
+
+test("hundreds of cross-cache outputs share one streaming upload process", async (t) => {
+  const context = await environment(t, { absent: ["a"] });
+  const events = Array.from({ length: 513 }, (_, index) => ({
+    ...event("EVAL", "a", true, "cached"),
+    outputs: { out: `/nix/store/a${index.toString().padStart(31, "0")}-package` },
+  }));
+  await builder(context, events);
+  const result = await execute(join(context.bundle, "build.mjs"), context.env);
+  assert.equal(result.exitCode, 0, result.stdout + result.stderr);
+  const pushes = (await readFile(context.env.PUSH_LOG!, "utf8")).trim().split("\n");
+  assert.equal(pushes.length, 1);
+  const push = JSON.parse(pushes[0]!);
+  assert.equal(push.paths.length, 513);
+  assert.deepEqual(push.args.slice(-3), ["--stdin", "--retry-timeout", "2m"]);
+  assert.match(result.stdout, /513 uploaded, 0 skipped, 0 failed/);
+});
+
+test("streaming upload errors fail the job even when niks3 exits successfully", async (t) => {
+  const context = await environment(t, { absent: ["b", "c"] });
+  context.env.FAIL_UPLOAD = storePath("b");
+  await builder(context, [event("EVAL", "b", true, "cached"), event("EVAL", "c", true, "cached")]);
+  const result = await execute(join(context.bundle, "build.mjs"), context.env);
+  assert.equal(result.exitCode, 1, result.stdout + result.stderr);
+  assert.match(result.stdout, /Cross-cache upload failed:.*server returned 503: unavailable/);
+  assert.match(result.stdout, /1 uploaded, 0 skipped, 1 failed/);
+  assert.equal((await readFile(context.env.PUSH_LOG!, "utf8")).trim().split("\n").length, 1);
+});
+
+test("size-limited streaming uploads warn without claiming the path was cached", async (t) => {
+  const context = await environment(t, { absent: ["b"] });
+  context.env.SKIP_UPLOAD = storePath("b");
+  await builder(context, [event("EVAL", "b", true, "cached")]);
+  const result = await execute(join(context.bundle, "build.mjs"), context.env);
+  assert.equal(result.exitCode, 0, result.stdout + result.stderr);
+  assert.match(
+    result.stdout,
+    /::warning::Cross-cache upload skipped:.*dependency exceeds server limit/,
+  );
+  assert.match(result.stdout, /0 uploaded, 1 skipped, 0 failed/);
+});
+
+test.for(["MISSING_UPLOAD", "INVALID_UPLOAD", "UPLOAD_EXIT"])(
+  "incomplete or invalid streaming upload fails the job: %s",
+  async (failure, t) => {
+    const context = await environment(t, { absent: ["b"] });
+    context.env[failure] = failure === "MISSING_UPLOAD" ? storePath("b") : "1";
+    await builder(context, [event("EVAL", "b", true, "cached")]);
+    const result = await execute(join(context.bundle, "build.mjs"), context.env);
+    assert.equal(result.exitCode, 1, result.stdout + result.stderr);
+    assert.match(
+      result.stdout,
+      /No niks3 upload result|Invalid niks3 upload result|niks3 upload process failed/,
+    );
+  },
+);
 
 test("server errors fail one batch without request fan-out or blocking later batches", async (t) => {
   const context = await environment(t, { reject: ["a"] });
