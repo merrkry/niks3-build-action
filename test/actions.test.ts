@@ -2,7 +2,7 @@ import { test, vi, type TestContext } from "vitest";
 import assert from "node:assert/strict";
 import Fastify from "fastify";
 import { execa } from "execa";
-import { cp, mkdtemp, mkdir, writeFile, readFile, rm, symlink } from "node:fs/promises";
+import { cp, mkdtemp, mkdir, writeFile, readFile, rm, symlink, lstat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import versions from "../versions.json" with { type: "json" };
@@ -116,12 +116,18 @@ async function environment(
   await writeFile(
     realBinary,
     `#!${process.execPath}
-import { appendFileSync, readFileSync } from 'node:fs';
+import assert from 'node:assert/strict';
+import { appendFileSync, readFileSync, readlinkSync } from 'node:fs';
 const args = process.argv.slice(2);
 const token = readFileSync(process.env.NIKS3_AUTH_TOKEN_FILE, 'utf8');
 const paths = args.includes('--stdin') ? readFileSync(0, 'utf8').trim().split('\\n') : args.filter(arg => arg.startsWith('/nix/store/'));
 appendFileSync(process.env.PUSH_LOG, JSON.stringify({ args, token, paths, config: process.env.NIX_CONFIG }) + '\\n');
 if (args.includes('--stdin')) {
+  if (process.env.REQUIRE_ROOTS) {
+    const roots = readFileSync(process.env.ROOTS_LOG, 'utf8').trim().split('\\n').map(line => JSON.parse(line));
+    const protectedPaths = new Set(roots.map(root => readlinkSync(root)));
+    for (const path of paths) assert.ok(protectedPaths.has(path), 'output must remain rooted during upload: ' + path);
+  }
   for (const path of paths) {
     if (path === process.env.MISSING_UPLOAD) continue;
     if (process.env.INVALID_UPLOAD) { console.log('invalid JSON'); break; }
@@ -151,7 +157,7 @@ if (args[0] === 'flake' || args[0] === 'eval') {
   process.exit(0);
 }
 const tools = {
-  ${JSON.stringify(`github:Mic92/niks3/v${versions.niks3}#niks3`)}: ${JSON.stringify(realBinary)},
+  ${JSON.stringify(`github:NixOS/nixpkgs/${versions.nixpkgs}#niks3`)}: ${JSON.stringify(realBinary)},
   ${JSON.stringify(`github:NixOS/nixpkgs/${versions.nixpkgs}#nix-fast-build`)}: ${JSON.stringify(join(directory, "nix-fast-build"))},
 };
 assert.equal(args[0], 'run');
@@ -171,17 +177,26 @@ process.execve(process.execPath, [process.execPath, tools[args[1]], ...args.slic
     join(bin, "nix-store"),
     `#!${process.execPath}
 import assert from 'node:assert/strict';
-import { appendFileSync, existsSync } from 'node:fs';
+import { appendFileSync, existsSync, symlinkSync } from 'node:fs';
 import { setTimeout } from 'node:timers/promises';
 const args = process.argv.slice(2);
 assert.equal(args[0], '--realise');
 while (process.env.WAIT_FOR_REFRESH && !existsSync(process.env.WAIT_FOR_REFRESH)) await setTimeout(10);
 const options = args.indexOf('--option');
-const paths = args.slice(1, options < 0 ? undefined : options);
+const rootIndex = args.indexOf('--add-root');
+const root = rootIndex < 0 ? undefined : args[rootIndex + 1];
+const paths = args.slice(1, options < 0 ? undefined : options).filter((arg, index, all) => arg !== '--add-root' && all[index - 1] !== '--add-root');
 assert.ok(paths.every(path => !path.endsWith('.drv')));
 if (process.env.EXPECT_CONFIG_LINE) assert.ok(process.env.NIX_CONFIG.includes(process.env.EXPECT_CONFIG_LINE));
 if (process.env.EXPECT_NIX_OPTIONS) assert.deepEqual(args.slice(options), JSON.parse(process.env.EXPECT_NIX_OPTIONS));
 appendFileSync(process.env.COPY_LOG, paths.join('\\n') + '\\n');
+if (root) {
+  for (const [index, path] of paths.entries()) {
+    const link = index === 0 ? root : root + '-' + (index + 1);
+    symlinkSync(path, link);
+    appendFileSync(process.env.ROOTS_LOG, JSON.stringify(link) + '\\n');
+  }
+}
 if (paths.includes(process.env.FAIL_DOWNLOAD)) process.exit(1);
 `,
     { mode: 0o755 },
@@ -190,6 +205,7 @@ if (paths.includes(process.env.FAIL_DOWNLOAD)) process.exit(1);
   env.FLAKE_LOG = join(directory, "flake");
   env.COPY_LOG = join(directory, "copies");
   env.PUSH_LOG = join(directory, "pushes");
+  env.ROOTS_LOG = join(directory, "roots");
   return { directory, bundle, env, created, completed, tokens, queries, concurrency };
 }
 
@@ -262,9 +278,16 @@ test.for([false, true])(
     assert.ok(args.includes("--skip-cached"));
     assert.ok(args.includes("--niks3-server"));
     const work = (await readFile(context.env.GITHUB_STATE!, "utf8")).split("\n")[1]!;
-    const cleanup = await execute(join(context.bundle, "cleanup.mjs"), { STATE_work: work });
+    const abandonedRoots = join(context.directory, "abandoned-roots");
+    await mkdir(abandonedRoots);
+    await symlink(storePath("a"), join(abandonedRoots, "output"));
+    const cleanup = await execute(join(context.bundle, "cleanup.mjs"), {
+      STATE_work: work,
+      STATE_roots: abandonedRoots,
+    });
     assert.equal(cleanup.exitCode, 0);
     await assert.rejects(readFile(join(work, "token")), { code: "ENOENT" });
+    await assert.rejects(lstat(abandonedRoots), { code: "ENOENT" });
   },
 );
 
@@ -478,22 +501,33 @@ test("remote copies share one CLI push and cannot block TTL refresh", async (t) 
   assert.deepEqual(context.completed, [`${"a".repeat(32)}.narinfo`]);
 });
 
-test("hundreds of cross-cache outputs share one streaming upload process", async (t) => {
-  const context = await environment(t, { absent: ["a"] });
-  const events = Array.from({ length: 513 }, (_, index) => ({
-    ...event("EVAL", "a", true, "cached"),
-    outputs: { out: `/nix/store/a${index.toString().padStart(31, "0")}-package` },
-  }));
-  await builder(context, events);
-  const result = await execute(join(context.bundle, "build.mjs"), context.env);
-  assert.equal(result.exitCode, 0, result.stdout + result.stderr);
-  const pushes = (await readFile(context.env.PUSH_LOG!, "utf8")).trim().split("\n");
-  assert.equal(pushes.length, 1);
-  const push = JSON.parse(pushes[0]!);
-  assert.equal(push.paths.length, 513);
-  assert.deepEqual(push.args.slice(-3), ["--stdin", "--retry-timeout", "2m"]);
-  assert.match(result.stdout, /513 uploaded, 0 skipped, 0 failed/);
-});
+test.for([false, true])(
+  "cross-cache outputs remain rooted through one streaming upload (failure: %s)",
+  async (failure, t) => {
+    const context = await environment(t, { absent: ["a"] });
+    context.env.REQUIRE_ROOTS = "true";
+    if (failure) context.env.UPLOAD_EXIT = "1";
+    const events = Array.from({ length: 513 }, (_, index) => ({
+      ...event("EVAL", "a", true, "cached"),
+      outputs: { out: `/nix/store/a${index.toString().padStart(31, "0")}-package` },
+    }));
+    await builder(context, events);
+    const result = await execute(join(context.bundle, "build.mjs"), context.env);
+    assert.equal(result.exitCode, failure ? 1 : 0, result.stdout + result.stderr);
+    const pushes = (await readFile(context.env.PUSH_LOG!, "utf8")).trim().split("\n");
+    assert.equal(pushes.length, 1);
+    const push = JSON.parse(pushes[0]!);
+    const roots = (await readFile(context.env.ROOTS_LOG!, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string);
+    assert.equal(roots.length, 513);
+    for (const root of roots) await assert.rejects(lstat(root), { code: "ENOENT" });
+    assert.equal(push.paths.length, 513);
+    assert.deepEqual(push.args.slice(-3), ["--stdin", "--retry-timeout", "2m"]);
+    assert.match(result.stdout, /513 uploaded, 0 skipped, 0 failed/);
+  },
+);
 
 test("streaming upload errors fail the job even when niks3 exits successfully", async (t) => {
   const context = await environment(t, { absent: ["b", "c"] });

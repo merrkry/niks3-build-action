@@ -4,6 +4,9 @@ import { Result } from "better-result";
 import { z } from "zod/mini";
 import { execa } from "execa";
 import PQueue from "p-queue";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { TokenProvider } from "./oidc.js";
 
 const http = new HttpClient("niks3-build-action", [], {
@@ -58,24 +61,38 @@ export class Niks3 {
     return paths.filter((_, index) => found.has(keys[index]!));
   }
 
-  private async download(paths: string[]) {
+  private async download(paths: string[], roots: string) {
     if (paths.some((path) => path.endsWith(".drv")))
       throw new Error("Expected output paths, not derivations");
-    // Output paths substitute without falling back to a source build.
-    await execa("nix-store", ["--realise", ...paths, ...this.nixOptions], {
-      stdout: "ignore",
-      stderr: "inherit",
-    });
+    const batchRoots = await mkdtemp(join(roots, "batch-"));
+    // Root outputs during realisation so GC cannot remove them before uploading.
+    await execa(
+      "nix-store",
+      ["--realise", ...paths, "--add-root", join(batchRoots, "output"), ...this.nixOptions],
+      {
+        stdout: "ignore",
+        stderr: "inherit",
+      },
+    );
   }
 
   private async copy(paths: string[]) {
-    const downloaded: string[] = [];
-    await batches("Cross-cache download", paths, async (batch) => {
-      await this.download(batch);
-      downloaded.push(...batch);
-    });
-    if (!downloaded.length) return;
+    if (!paths.length) return;
+    const roots = await mkdtemp(join(process.env.RUNNER_TEMP || tmpdir(), "niks3-roots-"));
+    core.saveState("roots", roots);
+    try {
+      const downloaded: string[] = [];
+      await batches("Cross-cache download", paths, async (batch) => {
+        await this.download(batch, roots);
+        downloaded.push(...batch);
+      });
+      if (downloaded.length) await this.upload(downloaded);
+    } finally {
+      await rm(roots, { recursive: true, force: true });
+    }
+  }
 
+  private async upload(downloaded: string[]) {
     const pending = new Set(downloaded);
     let uploaded = 0;
     let skipped = 0;
