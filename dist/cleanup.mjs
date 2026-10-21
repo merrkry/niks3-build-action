@@ -1,1 +1,1 @@
-import{l as e,o as t,t as n}from"./dist-D25irxed.mjs";import{rm as r}from"node:fs/promises";const i=t(`work`);if(i){let t=await n.tryPromise(()=>r(i,{recursive:!0,force:!0}));t.isErr()&&e(t.error)}export{};
+import{l as e,o as t,t as n}from"./dist-D25irxed.mjs";import{rm as r}from"node:fs/promises";for(let i of[`work`,`roots`]){let a=t(i);if(!a)continue;let o=await n.tryPromise(()=>r(a,{recursive:!0,force:!0}));o.isErr()&&e(o.error)}export{};

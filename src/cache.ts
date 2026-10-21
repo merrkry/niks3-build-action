@@ -4,6 +4,9 @@ import { Result } from "better-result";
 import { z } from "zod/mini";
 import { execa } from "execa";
 import PQueue from "p-queue";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { TokenProvider } from "./oidc.js";
 
 const http = new HttpClient("niks3-build-action", [], {
@@ -18,6 +21,13 @@ const pendingPush = z.object({
 const storePath = z
   .string()
   .check(z.regex(/^\/nix\/store\/[0-9abcdfghijklmnpqrsvwxyz]{32}-[^/]+$/));
+
+const pushResult = z.object({
+  path: storePath,
+  status: z.enum(["ok", "error"]),
+  message: z.optional(z.string()),
+  skipped: z.optional(z.string()),
+});
 
 export async function fetchAudience(server: string) {
   const response = await http.getJson(
@@ -51,19 +61,82 @@ export class Niks3 {
     return paths.filter((_, index) => found.has(keys[index]!));
   }
 
-  private async copy(paths: string[]) {
+  private async download(paths: string[], roots: string) {
     if (paths.some((path) => path.endsWith(".drv")))
       throw new Error("Expected output paths, not derivations");
-    // Output paths substitute without falling back to a source build.
-    await execa("nix-store", ["--realise", ...paths, ...this.nixOptions], {
-      stdout: "ignore",
-      stderr: "inherit",
-    });
-    await execa("niks3", ["push", "--server-url", this.server, "--stdin"], {
-      input: paths.join("\n") + "\n",
-      stdout: "inherit",
-      stderr: "inherit",
-    });
+    const batchRoots = await mkdtemp(join(roots, "batch-"));
+    // Root outputs during realisation so GC cannot remove them before uploading.
+    await execa(
+      "nix-store",
+      ["--realise", ...paths, "--add-root", join(batchRoots, "output"), ...this.nixOptions],
+      {
+        stdout: "ignore",
+        stderr: "inherit",
+      },
+    );
+  }
+
+  private async copy(paths: string[]) {
+    if (!paths.length) return;
+    const roots = await mkdtemp(join(process.env.RUNNER_TEMP || tmpdir(), "niks3-roots-"));
+    core.saveState("roots", roots);
+    try {
+      const downloaded: string[] = [];
+      await batches("Cross-cache download", paths, async (batch) => {
+        await this.download(batch, roots);
+        downloaded.push(...batch);
+      });
+      if (downloaded.length) await this.upload(downloaded);
+    } finally {
+      await rm(roots, { recursive: true, force: true });
+    }
+  }
+
+  private async upload(downloaded: string[]) {
+    const pending = new Set(downloaded);
+    let uploaded = 0;
+    let skipped = 0;
+    const child = execa(
+      "niks3",
+      ["push", "--server-url", this.server, "--stdin", "--retry-timeout", "2m"],
+      {
+        input: downloaded.join("\n") + "\n",
+        stderr: "inherit",
+        buffer: false,
+        reject: false,
+      },
+    );
+    for await (const line of child) {
+      const parsed = Result.try(() => pushResult.parse(JSON.parse(line)));
+      if (parsed.isErr()) {
+        core.setFailed(`Invalid niks3 upload result: ${line}`);
+        continue;
+      }
+      const result = parsed.value;
+      if (!pending.delete(result.path)) {
+        core.setFailed(`Unexpected niks3 upload result: ${result.path}`);
+        continue;
+      }
+      if (result.status === "error") {
+        core.setFailed(
+          `Cross-cache upload failed: ${result.path}: ${result.message ?? "unknown error"}`,
+        );
+      } else if (result.skipped) {
+        skipped++;
+        core.warning(
+          `Cross-cache upload skipped: ${result.path}: ${result.message ?? result.skipped}`,
+        );
+      } else {
+        uploaded++;
+        core.debug(`Cross-cache upload completed: ${result.path}`);
+      }
+    }
+    const result = await child;
+    if (result.failed) core.setFailed(`niks3 upload process failed: ${result.shortMessage}`);
+    for (const path of pending) core.setFailed(`No niks3 upload result: ${path}`);
+    core.info(
+      `Cross-cache upload: ${uploaded} uploaded, ${skipped} skipped, ${downloaded.length - uploaded - skipped} failed`,
+    );
   }
 
   private async refresh(paths: string[]) {
@@ -95,7 +168,7 @@ export class Niks3 {
     );
     await Promise.all([
       batches("TTL refresh", present, (batch) => this.refresh(batch)),
-      batches("Cross-cache upload", uploadCached ? missing : [], (batch) => this.copy(batch)),
+      this.copy(uploadCached ? missing : []),
     ]);
   }
 }

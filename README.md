@@ -47,7 +47,8 @@ The action sets these nix-fast-build options itself, and fails if `args` contain
 ## Notes
 
 - Authentication uses GitHub OIDC, so the job needs `id-token: write`. Without it, as in pull requests from forks, the action only builds.
-- `nix-fast-build` and `niks3` are taken from `PATH` if present. Otherwise they run from the nixpkgs revision pinned in [versions.json](versions.json).
+- `nix-fast-build` and `niks3` are taken from `PATH` if present. Otherwise they run from the nixpkgs revision pinned in [versions.json](versions.json). A client from `PATH` must be niks3 1.15.0 or newer. Upgrade the server before upgrading clients.
+- Cross-cache uploads share one `niks3 push --stdin` process with a two-minute retry budget per request. Per-path failures fail the job; paths skipped by the server's NAR size limit produce warnings.
 - `accept-flake-config` only affects processes started by this action. Later steps keep the original Nix config.
 - The job fails if any build fails, but outputs that were already cached are still refreshed or pushed first.
 - [Mic92/niks3-action](https://github.com/Mic92/niks3-action) adds niks3 as a substituter, so outputs already in niks3 are not rebuilt. `skip-push: true` leaves uploading to this action.
